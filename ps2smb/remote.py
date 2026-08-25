@@ -48,6 +48,8 @@ class RemoteFile:
         self._session = requests.Session()
         self._session.headers["User-Agent"] = USER_AGENT
         self._probe_lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
+        self._pending_prefetch: set = set()
 
     # ---------------------------------------------------------------- probe
 
@@ -183,7 +185,15 @@ class RemoteFile:
         return data
 
     def prefetch(self, chunk_index: int) -> None:
-        """Best-effort background download of one chunk (sequential prefetch)."""
+        """Best-effort background download of one chunk (sequential prefetch).
+        Skips chunks already cached or already being prefetched."""
+        if self.cache.has_chunk(self.file_key, chunk_index):
+            return
+        with self._prefetch_lock:
+            if chunk_index in self._pending_prefetch:
+                return
+            self._pending_prefetch.add(chunk_index)
+
         def worker():
             try:
                 self.cache.get_or_download(
@@ -192,6 +202,9 @@ class RemoteFile:
                 LOG.info("prefetch done %s chunk %d", self.file_key, chunk_index)
             except Exception as e:
                 LOG.warning("prefetch failed %s chunk %d: %s", self.file_key, chunk_index, e)
+            finally:
+                with self._prefetch_lock:
+                    self._pending_prefetch.discard(chunk_index)
 
         threading.Thread(target=worker, daemon=True, name="prefetch-%d" % chunk_index).start()
 

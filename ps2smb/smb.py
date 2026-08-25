@@ -32,6 +32,7 @@ from impacket.nt_errors import (
     STATUS_ACCESS_DENIED,
     STATUS_END_OF_FILE,
     STATUS_INVALID_HANDLE,
+    STATUS_NO_SUCH_FILE,
     STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_SUCCESS,
 )
@@ -44,6 +45,32 @@ from .catalog import Game
 from .remote import RemoteFile, RemoteFileError
 
 LOG = logging.getLogger("ps2smb.smb")
+
+
+def _patch_search_share():
+    """Make impacket's share lookup case-insensitive.
+
+    Stock searchShare() does config.has_section(share) against the raw string
+    the client sent. OPL requests shares in lowercase while addShare() stores
+    them uppercase, so TreeConnect fails with "TreeConnectAndX not found".
+    We monkeypatch it to retry with upper/lower variants before giving up.
+    """
+    import impacket.smbserver as smbserver
+    original = smbserver.searchShare
+
+    def searchShare(connId, share, smbServer):
+        result = original(connId, share, smbServer)
+        if result is None and share:
+            config = smbServer.getServerConfig()
+            for candidate in (share.upper(), share.lower()):
+                if config.has_section(candidate):
+                    return dict(config.items(candidate))
+        return result
+
+    smbserver.searchShare = searchShare
+
+
+_patch_search_share()
 
 MANIFEST_NAME = ".ps2smb.json"
 
@@ -77,7 +104,17 @@ class GameSMBServer:
         self._write_manifest()
 
         self._server.addShare(self.share_name, self.share_root,
-                              shareComment="PS2 SMB HTTP games", readOnly="yes")
+                              shareComment="PS2 SMB HTTP games", readOnly="no")
+
+        # impacket's searchShare() is case-sensitive: it does a raw
+        # config.has_section(share) against whatever casing the client sent.
+        # OPL requests the share in lowercase, so register an alias section
+        # for the lowercased name pointing at the same settings.
+        config = self.raw_server.getServerConfig()
+        if not config.has_section(self.share_name.lower()):
+            config.add_section(self.share_name.lower())
+            for key, value in config.items(self.share_name):
+                config.set(self.share_name.lower(), key, value)
 
         raw = self.raw_server
         raw.hookSmb2Command(smb2.SMB2_CREATE, self._smb2_create)
@@ -86,6 +123,7 @@ class GameSMBServer:
         raw.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, self._smb2_query_directory)
         raw.hookSmbCommand(smb.SMB.SMB_COM_NT_CREATE_ANDX, self._smb1_nt_create)
         raw.hookSmbCommand(smb.SMB.SMB_COM_READ_ANDX, self._smb1_read_andx)
+        raw.hookSmbCommand(smb.SMB.SMB_COM_CLOSE, self._smb1_close)
         raw.hookTransaction2(smb.SMB.TRANS2_FIND_FIRST2, self._smb1_find_first2)
         raw.hookTransaction2(smb.SMB.TRANS2_FIND_NEXT2, self._smb1_find_next2)
 
@@ -217,7 +255,8 @@ class GameSMBServer:
         except RemoteFileError as e:
             LOG.error("read failed %s@%d: %s", vhandle.game.filename, offset, e)
             smbServer.setConnectionData(connId, connData)
-            return [smb2.SMB2Error()], None, STATUS_ACCESS_DENIED
+            # Match stock smbComReadAndX: empty parameters/data on error.
+            return [smb.SMBCommand(smb.SMB.SMB_COM_READ_ANDX)], None, STATUS_ACCESS_DENIED
 
         # Sequential prefetch of following chunks in the background.
         chunk = self.cache.chunk_size
@@ -434,11 +473,22 @@ class GameSMBServer:
     # ------------------------------------------------- SMB1 TRANS2 find hooks
 
     def _virtual_entries(self, pattern):
-        """(filename, size) pairs for virtual games matching the glob."""
+        """(filename, size) pairs for virtual games matching the glob.
+
+        OPL's default ETH layout looks for games in \\CD\\ and \\DVD\\
+        subfolders of the share. We keep all ISOs at the share root but
+        answer those subfolder searches with the full game list so stock
+        OPL finds the games without changing its path setting.
+        """
         import fnmatch
+        pattern = (pattern or "*").replace("/", "\\").lower()
+        # A search inside CD/DVD (e.g. "\DVD\*") lists every game; anything
+        # else matches by filename as before.
+        if pattern.startswith("\\cd\\") or pattern.startswith("\\dvd\\"):
+            pattern = pattern.rsplit("\\", 1)[-1]
         entries = []
         for fname_lower, game in self.games.items():
-            if fnmatch.fnmatch(game.filename.lower(), (pattern or "*").lower()):
+            if fnmatch.fnmatch(game.filename.lower(), pattern):
                 entries.append((game.filename, self._remote_size_or_zero(fname_lower)))
         return entries
 
@@ -488,16 +538,18 @@ class GameSMBServer:
         # Only take over when the search targets our share root; otherwise the
         # stock handler must run.
         path = connData["ConnectedShares"].get(recvPacket["Tid"], {}).get("path", "")
+        name = req["FileName"]
+        if isinstance(name, bytes):
+            name = name.decode(
+                "utf-16le" if recvPacket["Flags2"] & smb.SMB.FLAGS2_UNICODE else "latin-1")
         if os.path.abspath(path) != os.path.abspath(self.share_root):
+            LOG.info("SMB1 find-first %r in %s -> stock", name, path)
             smbServer.setConnectionData(connId, connData)
             from impacket.smbserver import TRANS2Commands
             return TRANS2Commands.findFirst2(connId, smbServer, recvPacket,
                                              parameters, data, maxDataCount)
 
-        name = req["FileName"]
-        if isinstance(name, bytes):
-            name = name.decode(
-                "utf-16le" if recvPacket["Flags2"] & smb.SMB.FLAGS2_UNICODE else "latin-1")
+        LOG.info("SMB1 find-first %r (share root)", name)
         items = []
         errorCode = STATUS_SUCCESS
         for fname, size in self._virtual_entries(name.rstrip("\x00")):
@@ -650,6 +702,7 @@ class GameSMBServer:
         except RemoteFileError as e:
             LOG.error("read failed %s@%d: %s", vhandle.game.filename, offset, e)
             smbServer.setConnectionData(connId, connData)
+            # Match stock smbComReadAndX: empty parameters/data on error.
             return [smb.SMBCommand(smb.SMB.SMB_COM_READ_ANDX)], None, STATUS_ACCESS_DENIED
 
         chunk = self.cache.chunk_size
@@ -668,6 +721,39 @@ class GameSMBServer:
         respSMBCommand["Data"] = content
         smbServer.setConnectionData(connId, connData)
         return [respSMBCommand], None, STATUS_SUCCESS
+
+    def _smb1_close(self, connId, smbServer, SMBCommand, recvPacket):
+        """Close handler: virtual handles hold a VirtualFileHandle object in
+        'FileHandle' where stock impacket expects an OS fd (os.close fails
+        with "'VirtualFileHandle' object cannot be interpreted as an
+        integer"). Mirror the stock smbComClose but skip os.close for
+        virtual entries."""
+        connData = smbServer.getConnectionData(connId)
+        comClose = smb.SMBClose_Parameters(SMBCommand["Parameters"])
+        fid = comClose["FID"]
+
+        if recvPacket["Tid"] not in connData["ConnectedShares"]:
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_CLOSE)], None, STATUS_SMB_BAD_TID
+
+        opened = connData["OpenedFiles"].get(fid)
+        if opened is None:
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_CLOSE)], None, STATUS_INVALID_HANDLE
+
+        errorCode = STATUS_SUCCESS
+        fh = opened.get("FileHandle")
+        if isinstance(fh, VirtualFileHandle):
+            LOG.debug("SMB1 close %s", fh.game.filename)
+        else:
+            # Real file on disk (manifest etc.): let stock impacket do it.
+            smbServer.setConnectionData(connId, connData)
+            from impacket.smbserver import SMBCommands
+            return SMBCommands.smbComClose(connId, smbServer, SMBCommand, recvPacket)
+
+        del connData["OpenedFiles"][fid]
+        smbServer.setConnectionData(connId, connData)
+        return [smb.SMBCommand(smb.SMB.SMB_COM_CLOSE)], None, errorCode
 
     # ------------------------------------------------------------------- admin
 

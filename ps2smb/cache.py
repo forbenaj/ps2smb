@@ -30,10 +30,9 @@ class ChunkCache:
         os.makedirs(self.root, exist_ok=True)
         # file_key -> {chunk_index: path} of chunks known to exist on disk
         self._present: Dict[str, Set[int]] = {}
-        # file_key -> per-file download locks
-        self._locks: Dict[str, threading.Lock] = {}
+        # file_key -> {chunk_index: threading.Lock} of per-chunk download locks
+        self._locks: Dict[str, Dict[int, threading.Lock]] = {}
         self._locks_guard = threading.Lock()
-        self._global_lock = threading.Lock()
 
     # ------------------------------------------------------------------ keys
 
@@ -50,11 +49,11 @@ class ChunkCache:
     def _chunk_path(self, file_key: str, index: int) -> str:
         return os.path.join(self._chunks_dir(file_key), "%08d.chunk" % index)
 
-    def _lock_for(self, file_key: str) -> threading.Lock:
+    def _lock_for(self, file_key: str, index: int) -> threading.Lock:
+        """One lock per (file, chunk): a foreground read only ever waits on
+        the chunk it actually needs, never on unrelated downloads."""
         with self._locks_guard:
-            if file_key not in self._locks:
-                self._locks[file_key] = threading.Lock()
-            return self._locks[file_key]
+            return self._locks.setdefault(file_key, {}).setdefault(index, threading.Lock())
 
     # ------------------------------------------------------------- discovery
 
@@ -137,15 +136,17 @@ class ChunkCache:
     ) -> bytes:
         """Return chunk bytes, downloading via fetch_range if not cached.
 
-        A single global lock prevents two threads from downloading the same
-        missing chunk concurrently; after acquiring it we re-check the cache.
+        A per-chunk lock prevents two threads from downloading the same chunk
+        concurrently; after acquiring it we re-check the cache. Different
+        chunks (e.g. a foreground read vs. background prefetch of the next
+        chunk) download in parallel.
         """
         data = self.read_chunk(file_key, index)
         if data is not None:
             LOG.info("cache HIT  %s chunk %d", file_key, index)
             return data
 
-        with self._global_lock:
+        with self._lock_for(file_key, index):
             data = self.read_chunk(file_key, index)
             if data is not None:
                 LOG.info("cache HIT  %s chunk %d (after wait)", file_key, index)
