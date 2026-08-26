@@ -107,6 +107,7 @@ class GameSMBServer:
         raw.hookSmb2Command(smb2.SMB2_QUERY_INFO, self._smb2_query_info)
         raw.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, self._smb2_query_directory)
         raw.hookSmbCommand(smb.SMB.SMB_COM_NT_CREATE_ANDX, self._smb1_nt_create)
+        raw.hookSmbCommand(smb.SMB.SMB_COM_OPEN_ANDX, self._smb1_open_andx)
         raw.hookSmbCommand(smb.SMB.SMB_COM_READ_ANDX, self._smb1_read_andx)
         raw.hookSmbCommand(smb.SMB.SMB_COM_READ, self._smb1_read)
         raw.hookSmbCommand(smb.SMB.SMB_COM_FLUSH, self._smb1_flush)
@@ -515,6 +516,54 @@ class GameSMBServer:
         respParameters["IsDirectory"] = 0
 
         respSMBCommand = smb.SMBCommand(smb.SMB.SMB_COM_NT_CREATE_ANDX)
+        respSMBCommand["Parameters"] = respParameters
+        respSMBCommand["Data"] = b""
+        smbServer.setConnectionData(connId, connData)
+        return [respSMBCommand], None, STATUS_SUCCESS
+
+    def _smb1_open_andx(self, connId, smbServer, SMBCommand, recvPacket):
+        connData = smbServer.getConnectionData(connId)
+        openAndXParameters = smb.SMBOpenAndX_Parameters(SMBCommand["Parameters"])
+        openAndXData = smb.SMBOpenAndX_Data(flags=recvPacket["Flags2"],
+                                            data=SMBCommand["Data"])
+        name = openAndXData["FileName"]
+        if isinstance(name, (bytes, bytearray)):
+            if recvPacket["Flags2"] & smb.SMB.FLAGS2_UNICODE:
+                name = name.decode("utf-16le", "replace")
+            else:
+                name = name.decode("latin-1", "replace")
+        vname = self._virtual_name(name)
+        if vname is None:
+            smbServer.setConnectionData(connId, connData)
+            return stock_smb1("smbComOpenAndX", connId, smbServer,
+                              SMBCommand, recvPacket)
+
+        LOG.info("SMB1 open(ANDX) %s", vname)
+        game = self.games[vname]
+        remote = self._remote_for(vname)
+        try:
+            remote.ensure_probed()
+        except RemoteFileError as e:
+            LOG.error("cannot serve %s: %s", vname, e)
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_OPEN_ANDX)], None, STATUS_ACCESS_DENIED
+
+        fid = 1 if not connData["OpenedFiles"] else list(connData["OpenedFiles"].keys())[-1] + 1
+        path_name = os.path.join(self.share_root, game.filename)
+        register_open(connData, fid, VirtualFileHandle(game, remote), path_name)
+
+        respParameters = smb.SMBOpenAndXResponse_Parameters()
+        respParameters["Fid"] = fid
+        respParameters["FileAttributes"] = smb.SMB_FILE_ATTRIBUTE_NORMAL
+        respParameters["LastWriten"] = 0
+        respParameters["FileSize"] = remote.size  # EndOfFile for Open&X responses
+        respParameters["GrantedAccess"] = openAndXParameters["DesiredAccess"]
+        respParameters["FileType"] = 0
+        respParameters["IPCState"] = 0
+        respParameters["Action"] = 0x1  # file existed and was opened
+        respParameters["ServerFid"] = fid
+
+        respSMBCommand = smb.SMBCommand(smb.SMB.SMB_COM_OPEN_ANDX)
         respSMBCommand["Parameters"] = respParameters
         respSMBCommand["Data"] = b""
         smbServer.setConnectionData(connId, connData)
