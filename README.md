@@ -188,9 +188,14 @@ ps2smb/
   cache.py     persistent chunk cache
   remote.py    HTTP-backed sparse virtual file (+ probing, prefetch)
   catalog.py   JSON catalog → sanitized filenames
-  smb.py       impacket-based SMB server with virtual-file hooks
   admin.py     status HTTP interface
   server.py    CLI entrypoint (python -m ps2smb.server)
+  smb/         impacket-based SMB layer exposing the virtual files
+    compat.py    impacket shims: case-insensitive shares, wire logging,
+                 stock-handler delegation, FileID resolution
+    virtual.py   VirtualFileHandle + open-file registration
+    listing.py   shared SMB1/SMB2 directory-listing entry construction
+    server.py    GameSMBServer with the SMB1/SMB2 command hooks
 tests/
   conftest.py              fake HTTP range server fixture
   test_virtual_file.py     core layer tests
