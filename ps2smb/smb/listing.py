@@ -43,16 +43,28 @@ def now_ft() -> int:
 def virtual_entries(games: dict, size_for, pattern: str):
     """(filename, size) pairs for games matching a find-first glob.
 
-    OPL's default ETH layout looks for games in \\CD\\ and \\DVD\\ subfolders
-    of the share. We keep all ISOs at the share root but answer those
+    OPL's default ETH layout looks for games in ``\\CD\\`` and ``\\DVD\\``
+    subfolders of the share. We keep all ISOs at the share root but answer those
     subfolder searches with the full game list so stock OPL finds the games
     without changing its path setting.
+
+    Previously both ``\\CD\\*`` and ``\\DVD\\*`` were treated identically,
+    each returning the full list of games. OPL issues separate directory
+    listings for the two virtual folders, which caused duplicate entries to be
+    displayed. To avoid this, we now only emulate one of the virtual folders –
+    ``\\CD\\`` – and return an empty list for ``\\DVD\\`` searches. This
+    preserves compatibility (most OPL configurations use the CD folder) while
+    eliminating duplicate listings.
     """
     pattern = (pattern or "*").replace("/", "\\").lower()
-    # A search inside CD/DVD (e.g. "\DVD\*") lists every game; anything else
-    # matches by filename as before.
-    if pattern.startswith("\\cd\\") or pattern.startswith("\\dvd\\"):
+    # A search inside CD returns every game; DVD searches return none to avoid
+    # duplicate listings.
+    if pattern.startswith("\\cd\\"):
+        # Strip the leading virtual folder path, keep the actual glob.
         pattern = pattern.rsplit("\\", 1)[-1]
+    elif pattern.startswith("\\dvd\\"):
+        # Return no entries for DVD virtual folder to prevent duplicates.
+        return []
     entries = []
     for fname_lower, game in games.items():
         if fnmatch.fnmatch(game.filename.lower(), pattern):
