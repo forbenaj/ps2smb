@@ -59,6 +59,10 @@ def main(argv=None):
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    # impacket logs server-side errors (failed handlers, disconnects) through
+    # its own loggers; without this they are invisible and OPL stalls look
+    # like "nothing happened".
+    logging.getLogger("impacket").setLevel(logging.DEBUG)
     LOG = logging.getLogger("ps2smb")
 
     games = load_catalog(args.catalog)

@@ -46,6 +46,16 @@ from .remote import RemoteFile, RemoteFileError
 
 LOG = logging.getLogger("ps2smb.smb")
 
+_SMB1_CMD_NAMES = {
+    0x00: "NEGOTIATE", 0x01: "SETUP_ANDX", 0x02: "TREE_DISCONNECT", 0x03: "TREE_CONNECT",
+    0x04: "QUERY_INFORMATION", 0x05: "CHECK_DIRECTORY", 0x06: "WRITE", 0x07: "WRITE_RAW",
+    0x08: "CLOSE", 0x09: "FLUSH", 0x0A: "READ", 0x0B: "READ_ANDX", 0x0C: "WRITE_ANDX",
+    0x10: "TRANS", 0x20: "READ_RAW", 0x21: "WRITE_MPX", 0x22: "READ_MPX",
+    0x24: "WRITE_CLOSE", 0x25: "TRANS2", 0x2B: "ECHO", 0x2D: "OPEN_ANDX",
+    0x2E: "READ_ANDX2", 0x32: "TRANS2_2", 0x42: "NT_TRANSACT",
+    0x72: "NEGOTIATE2", 0x73: "SESSION_SETUP_ANDX", 0x74: "LOGOFF_ANDX",
+    0x75: "TREE_CONNECT_ANDX", 0xA2: "NT_CREATE_ANDX", 0xC0: "NO_OP",
+}
 
 def _patch_search_share():
     """Make impacket's share lookup case-insensitive.
@@ -117,12 +127,15 @@ class GameSMBServer:
                 config.set(self.share_name.lower(), key, value)
 
         raw = self.raw_server
+        self._install_command_logger(raw)
         raw.hookSmb2Command(smb2.SMB2_CREATE, self._smb2_create)
         raw.hookSmb2Command(smb2.SMB2_READ, self._smb2_read)
         raw.hookSmb2Command(smb2.SMB2_QUERY_INFO, self._smb2_query_info)
         raw.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, self._smb2_query_directory)
         raw.hookSmbCommand(smb.SMB.SMB_COM_NT_CREATE_ANDX, self._smb1_nt_create)
         raw.hookSmbCommand(smb.SMB.SMB_COM_READ_ANDX, self._smb1_read_andx)
+        raw.hookSmbCommand(smb.SMB.SMB_COM_READ, self._smb1_read)
+        raw.hookSmbCommand(smb.SMB.SMB_COM_FLUSH, self._smb1_flush)
         raw.hookSmbCommand(smb.SMB.SMB_COM_CLOSE, self._smb1_close)
         raw.hookTransaction2(smb.SMB.TRANS2_FIND_FIRST2, self._smb1_find_first2)
         raw.hookTransaction2(smb.SMB.TRANS2_FIND_NEXT2, self._smb1_find_next2)
@@ -131,6 +144,31 @@ class GameSMBServer:
                  listen_address, port, listen_address or "0.0.0.0", self.share_name, len(self.games))
 
     # ------------------------------------------------------------------ util
+
+    @staticmethod
+    def _install_command_logger(raw):
+        """Log every incoming SMB1/SMB2 command ID, including commands we do
+        not hook. Without this, a stall inside a stock impacket handler is
+        completely invisible."""
+        log = logging.getLogger("ps2smb.wire")
+        orig_process = raw.processRequest
+
+        def processRequest(connId, data):
+            try:
+                # data is the SMB message WITHOUT the 4-byte NetBIOS header
+                # (handler passes p.get_trailer()): '\xffSMB' + cmd at [4].
+                if data[0:4] == b"\xffSMB":
+                    cmd = data[4]
+                    log.debug("SMB1 cmd=0x%02x (%s)", cmd, _SMB1_CMD_NAMES.get(cmd, "?"))
+                else:
+                    from impacket import smb2 as _smb2mod
+                    pkt = _smb2mod.SMB2Packet(data=data)
+                    log.debug("SMB2 cmd=0x%04x", pkt["Command"])
+            except Exception:
+                pass  # never break dispatch over logging
+            return orig_process(connId, data)
+
+        raw.processRequest = processRequest
 
     def _write_manifest(self):
         manifest = {
@@ -569,20 +607,31 @@ class GameSMBServer:
         sid = 0x80
         searchCount = 0
         totalData = 0
-        respData = b""
+        blobs = []
         for i, item in enumerate(items):
-            blob = item.getData()
-            padLen = (8 - (len(blob) % 8)) % 8
-            if totalData + len(blob) >= maxDataCount or (i + 1) > req["SearchCount"]:
+            blob = bytearray(item.getData())
+            padLen = (4 - (len(blob) % 4)) % 4
+            # Always emit at least one entry (see _smb1_find_next2).
+            if blobs and (totalData + len(blob) + padLen > maxDataCount
+                          or searchCount >= req["SearchCount"]):
                 endOfSearch = 0
                 sid = (max(connData["SIDs"]) + 1) if connData["SIDs"] else 1
                 connData["SIDs"][sid] = items[i:]
                 respParameters["LastNameOffset"] = totalData
                 break
             searchCount += 1
-            blob += b"\x00" * padLen
-            respData += blob
-            totalData += len(blob)
+            blobs.append((blob, padLen))
+            totalData += len(blob) + padLen
+
+        # Chain NextEntryOffset: each entry's first 4 bytes point at the next
+        # entry from the start of this one; 0 marks the last. OPL walks this
+        # linked list — all-zero offsets make it loop forever.
+        import struct as _struct
+        for j, (blob, padLen) in enumerate(blobs):
+            entry_len = len(blob) + padLen
+            next_off = 0 if j == len(blobs) - 1 else entry_len
+            blob[0:4] = _struct.pack("<I", next_off)
+        respData = b"".join(bytes(b) + b"\x00" * p for b, p in blobs)
 
         respParameters["SID"] = sid
         respParameters["EndOfSearch"] = endOfSearch
@@ -602,26 +651,41 @@ class GameSMBServer:
         searchResult = connData["SIDs"][sid]
         respParameters = smb.SMBFindNext2Response_Parameters()
         endOfSearch = 1
-        searchCount = 1
+        searchCount = 0
         totalData = 0
-        respData = b""
+        blobs = []
         for i, item in enumerate(searchResult):
-            blob = item.getData()
-            padLen = (8 - (len(blob) % 8)) % 8
-            if totalData + len(blob) >= maxDataCount or (i + 1) >= req["SearchCount"]:
+            blob = bytearray(item.getData())
+            padLen = (4 - (len(blob) % 4)) % 4
+            # ALWAYS emit at least one entry per response, even if it exceeds
+            # SearchCount/maxDataCount — a zero-entry reply with EndOfSearch=0
+            # makes OPL re-issue FIND_NEXT2 forever. Limits apply from the
+            # SECOND entry onwards.
+            if blobs and (totalData + len(blob) + padLen > maxDataCount
+                          or searchCount >= req["SearchCount"]):
                 endOfSearch = 0
                 connData["SIDs"][sid] = searchResult[i:]
                 respParameters["LastNameOffset"] = totalData
                 break
             searchCount += 1
-            blob += b"\x00" * padLen
-            respData += blob
-            totalData += len(blob)
+            blobs.append((blob, padLen))
+            totalData += len(blob) + padLen
+
+        # Chain NextEntryOffset (see _smb1_find_first2).
+        import struct as _struct
+        for j, (blob, padLen) in enumerate(blobs):
+            entry_len = len(blob) + padLen
+            next_off = 0 if j == len(blobs) - 1 else entry_len
+            blob[0:4] = _struct.pack("<I", next_off)
+        respData = b"".join(bytes(b) + b"\x00" * p for b, p in blobs)
 
         if endOfSearch > 0:
             del connData["SIDs"][sid]
         respParameters["EndOfSearch"] = endOfSearch
         respParameters["SearchCount"] = searchCount
+        LOG.debug("SMB1 find-next sid=%d returned=%d eos=%d pending=%d",
+                  sid, searchCount, endOfSearch,
+                  len(connData["SIDs"].get(sid, [])) if endOfSearch == 0 else 0)
         smbServer.setConnectionData(connId, connData)
         return b"", respParameters, respData, STATUS_SUCCESS
 
@@ -721,6 +785,65 @@ class GameSMBServer:
         respSMBCommand["Data"] = content
         smbServer.setConnectionData(connId, connData)
         return [respSMBCommand], None, STATUS_SUCCESS
+
+    def _smb1_read(self, connId, smbServer, SMBCommand, recvPacket):
+        """SMB_COM_READ (legacy, non-AndX). Stock handler calls os.lseek/os.read
+        on FileHandle, which raises TypeError on a VirtualFileHandle and makes
+        the read fail with ACCESS_DENIED -> OPL stalls. Serve virtual handles
+        ourselves, delegate everything else to stock."""
+        connData = smbServer.getConnectionData(connId)
+        readParams = smb.SMBRead_Parameters(SMBCommand["Parameters"])
+
+        opened = self._opened(connData, readParams["Fid"])
+        vhandle = self._virtual_handle(opened)
+        if vhandle is None:
+            smbServer.setConnectionData(connId, connData)
+            from impacket.smbserver import SMBCommands
+            return SMBCommands.smbComRead(connId, smbServer, SMBCommand, recvPacket)
+
+        offset = readParams["Offset"]
+        length = readParams["Count"]
+        LOG.debug("SMB1 read(legacy) %s offset=%d length=%d",
+                  vhandle.game.filename, offset, length)
+        try:
+            content = vhandle.remote.read(offset, length)
+        except RemoteFileError as e:
+            LOG.error("read failed %s@%d: %s", vhandle.game.filename, offset, e)
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_READ)], None, STATUS_ACCESS_DENIED
+
+        respParameters = smb.SMBReadResponse_Parameters()
+        respParameters["DataLength"] = len(content)
+        respSMBCommand = smb.SMBCommand(smb.SMB.SMB_COM_READ)
+        respSMBCommand["Parameters"] = respParameters
+        respSMBCommand["Data"] = content
+        smbServer.setConnectionData(connId, connData)
+        return [respSMBCommand], None, STATUS_SUCCESS
+
+    def _smb1_flush(self, connId, smbServer, SMBCommand, recvPacket):
+        """SMB_COM_FLUSH: stock calls os.fsync(FileHandle) which fails on a
+        VirtualFileHandle (read-only share anyway). Return success for virtual
+        handles, delegate real files to stock."""
+        connData = smbServer.getConnectionData(connId)
+        comFlush = smb.SMBFlush_Parameters(SMBCommand["Parameters"])
+
+        if recvPacket["Tid"] not in connData["ConnectedShares"]:
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_FLUSH)], None, STATUS_SMB_BAD_TID
+
+        opened = connData["OpenedFiles"].get(comFlush["FID"])
+        if opened is None:
+            smbServer.setConnectionData(connId, connData)
+            return [smb.SMBCommand(smb.SMB.SMB_COM_FLUSH)], None, STATUS_INVALID_HANDLE
+
+        if not isinstance(opened.get("FileHandle"), VirtualFileHandle):
+            smbServer.setConnectionData(connId, connData)
+            from impacket.smbserver import SMBCommands
+            return SMBCommands.smbComFlush(connId, smbServer, SMBCommand, recvPacket)
+
+        LOG.debug("SMB1 flush %s", opened["FileName"])
+        smbServer.setConnectionData(connId, connData)
+        return [smb.SMBCommand(smb.SMB.SMB_COM_FLUSH)], None, STATUS_SUCCESS
 
     def _smb1_close(self, connId, smbServer, SMBCommand, recvPacket):
         """Close handler: virtual handles hold a VirtualFileHandle object in
